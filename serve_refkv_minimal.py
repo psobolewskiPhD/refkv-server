@@ -3,20 +3,22 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "click",
-#   "refkv[zarr]>=0.1.0",
+#   # refkv's zarrify API, unreleased: built from git, with Rust (see the README)
+#   "refkv[zarr] @ git+https://github.com/d-v-b/refkv@6096eb667c76f485f8a16c6e22a68313f2e4adba#subdirectory=python",
 #   "zarr-http-server",
 # ]
 # ///
 """Serve every image file under a directory as a read-only Zarr v3 store over HTTP.
 
 refkv (https://github.com/d-v-b/refkv) reads an image file (e.g. SVS, NDPI, OME-TIFF,
-QPTIFF, CZI) and builds an *index* of it: a Zarr hierarchy (OME-Zarr
+QPTIFF, CZI) and zarrifies it, building an *index* of it: a Zarr hierarchy (OME-Zarr
 multiscales metadata, plus refkv's own) whose chunks are references to byte
 ranges in the original file. This script serves that hierarchy, exactly as refkv
 wrote it, with zarr-http-server. Nothing is decoded or re-encoded: each chunk is
 read from the file and sent as stored (e.g. a complete JPEG tile, codec
 "imagecodecs_jpeg"), so clients need the matching Zarr codecs (Python:
-`pip install imagecodecs-zarr`).
+`pip install 'refkv[images]'`, which installs imagecodecs-zarr's codecs and refkv's own,
+such as "refkv.tiff_lzw").
 
     uv run serve_refkv_minimal.py /path/to/images -i /path/to/index-cache
 
@@ -64,7 +66,7 @@ from typing import NamedTuple
 
 import click
 import refkv.zarr
-from refkv.virtualize import Rejected, virtualize
+from refkv.zarrify import Rejected, zarrify
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -129,7 +131,7 @@ class ImageRouter:
             log.info("indexing %s -> %s", path, vzip)
             vzip.parent.mkdir(parents=True, exist_ok=True)
             partial = vzip.with_name(vzip.name + ".partial")
-            virtualize(str(path)).save(str(partial))
+            zarrify(str(path)).save(str(partial))
             partial.replace(vzip)  # so a reader never sees a half-written index
         # no per-image cap on reads in flight: the router caps them across all images
         return refkv.zarr.open(str(vzip), max_concurrency=None)
