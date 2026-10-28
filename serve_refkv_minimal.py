@@ -3,20 +3,22 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "click",
-#   "refkv[zarr]>=0.1.0",
+#   # refkv's zarrify API, unreleased: built from git, with Rust (see the README)
+#   "refkv[zarr] @ git+https://github.com/d-v-b/refkv@6096eb667c76f485f8a16c6e22a68313f2e4adba#subdirectory=python",
 #   "zarr-http-server",
 # ]
 # ///
 """Serve every image file under a directory as a read-only Zarr v3 store over HTTP.
 
 refkv (https://github.com/d-v-b/refkv) reads an image file (e.g. SVS, NDPI, OME-TIFF,
-QPTIFF, CZI) and builds an *index* of it: a Zarr hierarchy (OME-Zarr
+QPTIFF, CZI) and zarrifies it, building an *index* of it: a Zarr hierarchy (OME-Zarr
 multiscales metadata, plus refkv's own) whose chunks are references to byte
 ranges in the original file. This script serves that hierarchy, exactly as refkv
 wrote it, with zarr-http-server. Nothing is decoded or re-encoded: each chunk is
 read from the file and sent as stored (e.g. a complete JPEG tile, codec
 "imagecodecs_jpeg"), so clients need the matching Zarr codecs (Python:
-`pip install imagecodecs-zarr`).
+`pip install 'refkv[images]'`, which installs imagecodecs-zarr's codecs and refkv's own,
+such as "refkv.tiff_lzw").
 
     uv run serve_refkv_minimal.py /path/to/images -i /path/to/index-cache
 
@@ -59,12 +61,13 @@ import pathlib
 import signal
 import tempfile
 from collections import OrderedDict
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 import click
 import refkv.zarr
-from refkv.virtualize import Rejected, virtualize
+from refkv.zarrify import Rejected, zarrify
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -99,22 +102,35 @@ class ImageRouter:
         self.open_images: OrderedDict[str, Starlette] = OrderedDict()  # least -> most recently used
         self._opening: dict[str, asyncio.Task] = {}  # images being opened, shared by their requests
 
-    def parse_request_path(self, url_path: str) -> ImageRequest | None:
-        """Split a URL path at the file it names under the root:
-        '/a/image.svs.zarr/0/c/0/1/2' -> ImageRequest('a/image.svs', 'a/image.svs.zarr', '0/c/0/1/2').
-        None if no prefix of the path is a file under the root."""
+    @staticmethod
+    def split_request_path(url_path: str) -> Iterator[ImageRequest]:
+        """Each way to split a URL path into an image and a key, shortest image first:
+        '/a/image.svs.zarr/0/zarr.json' -> ('a', 'a', 'image.svs.zarr/0/zarr.json'),
+        ('a/image.svs', 'a/image.svs.zarr', '0/zarr.json'), ... Nothing for a path with
+        an empty, '.' or '..' segment."""
         parts = url_path.strip("/").split("/")
         if any(p in ("", ".", "..") for p in parts):
-            return None
+            return
         for i in range(1, len(parts) + 1):
             prefix = "/".join(parts[:i])
-            image = prefix.removesuffix(ZARR_URL_SUFFIX)
-            path = self.root / image
-            if image in self.open_images or path.is_file():
-                if not path.resolve().is_relative_to(self.root):  # a symlink out of the root
-                    return None
-                return ImageRequest(image, prefix, "/".join(parts[i:]))
-            if not (self.root / prefix).is_dir():
+            yield ImageRequest(prefix.removesuffix(ZARR_URL_SUFFIX), prefix, "/".join(parts[i:]))
+
+    def find_open_image(self, url_path: str) -> ImageRequest | None:
+        """The URL path split at the open image it names, or None. Checks no files, so
+        requests for already open images don't wait on the filesystem."""
+        return next((r for r in self.split_request_path(url_path) if r.image in self.open_images), None)
+
+    def find_image_file(self, url_path: str) -> ImageRequest | None:
+        """The URL path split at the file it names under the root:
+        '/a/image.svs.zarr/0/c/0/1/2' -> ImageRequest('a/image.svs', 'a/image.svs.zarr', '0/c/0/1/2').
+        None if no prefix of the path is a file under the root. Blocking: it checks the
+        filesystem at each level of the path."""
+        for request in self.split_request_path(url_path):
+            path = self.root / request.image
+            if path.is_file():
+                # a symlink out of the root is answered like a missing file
+                return request if path.resolve().is_relative_to(self.root) else None
+            if not (self.root / request.prefix).is_dir():
                 return None
         return None
 
@@ -129,7 +145,7 @@ class ImageRouter:
             log.info("indexing %s -> %s", path, vzip)
             vzip.parent.mkdir(parents=True, exist_ok=True)
             partial = vzip.with_name(vzip.name + ".partial")
-            virtualize(str(path)).save(str(partial))
+            zarrify(str(path)).save(str(partial))
             partial.replace(vzip)  # so a reader never sees a half-written index
         # no per-image cap on reads in flight: the router caps them across all images
         return refkv.zarr.open(str(vzip), max_concurrency=None)
@@ -168,7 +184,10 @@ class ImageRouter:
     async def __call__(self, scope, receive, send):
         # the path below this app's mount point (the route's {path}), not scope["path"],
         # which also holds root_path when the app is mounted under a prefix
-        request = self.parse_request_path(scope["path_params"]["path"])
+        url_path = scope["path_params"]["path"]
+        request = self.find_open_image(url_path)
+        if request is None:
+            request = await asyncio.to_thread(self.find_image_file, url_path)
         if request is None:
             return await PlainTextResponse("Not found", 404)(scope, receive, send)
         try:

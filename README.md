@@ -3,15 +3,16 @@
 `serve_refkv_minimal.py` serves every image file under a directory as a read-only
 Zarr v3 store over HTTP.
 
-It uses [refkv](https://github.com/d-v-b/refkv) to index image files (SVS, NDPI,
-OME-TIFF, QPTIFF, CZI, and any other format refkv reads) on-demand if indexes
-don't exist. The index is a Zarr hierarchy with OME-Zarr multiscales metadata, 
-whose chunks point to byte ranges in the original file. The script serves that 
+It uses [refkv](https://github.com/d-v-b/refkv) to zarrify image files (SVS, NDPI,
+OME-TIFF, QPTIFF, CZI, and any other format refkv reads), building indexes
+on-demand if they don't exist. The index is a Zarr hierarchy with OME-Zarr multiscales
+metadata, whose chunks point to byte ranges in the original file. The script serves that 
 index with [zarr-http-server](https://github.com/zarr-developers/zarr-python/tree/main/packages/zarr-http-server).
 
 Note: each chunk is read from the image file and sent as stored, for
 example as a complete JPEG tile. Clients need the matching Zarr codecs; in Python,
-install `imagecodecs-zarr`.
+install `refkv[images]`, which provides imagecodecs-zarr's codecs (such as
+`imagecodecs_jpeg`) and refkv's own (such as `refkv.tiff_lzw`).
 
 This script started as a hand-rolled proof of concept that was further developed
 and tested with use of Claude Opus 5.5.
@@ -19,7 +20,12 @@ and tested with use of Claude Opus 5.5.
 ## Running
 
 The script declares its own dependencies, so it runs with
-[uv](https://docs.astral.sh/uv/) and nothing else installed:
+[uv](https://docs.astral.sh/uv/). refkv's zarrify API is not yet released on PyPI,
+so the script pins refkv to a git commit, which uv builds from source on the first
+run. This needs `git`, and uses the [Rust toolchain](https://rustup.rs/) (1.85 or
+newer) on `PATH`; without one, refkv's build backend (maturin) downloads one for the
+build. Homebrew's `rustup` is keg-only: put `$(brew --prefix rustup)/bin` on `PATH`
+to use it.
 
 ```sh
 uv run serve_refkv_minimal.py /path/to/images -i /path/to/index-cache
@@ -44,7 +50,9 @@ A file that refkv cannot read returns 404, the same as a missing file.
 
 An image is indexed on its first request, and the index is saved as `<path>.vzip` in
 the `--index-dir` directory. A saved index is reused whenever it exists; the
-image files are assumed never to change.
+image files are assumed never to change. After upgrading refkv, empty the index
+directory so the files are indexed again (refkv has renamed some of the codecs its
+indexes name, such as `imagecodecs_lzw` to `refkv.tiff_lzw`).
 
 Without `--index-dir`, indexes are kept in a temporary directory that is removed when
 the server stops.
@@ -67,6 +75,7 @@ precedence.
 
 ## Docker
 
-The `Dockerfile` builds an image for Google Cloud Run. It expects the images mounted
-at `/images` and an index directory at `/index`, and listens on `$PORT` (8080 by
-default).
+The `Dockerfile` builds an image for Google Cloud Run. refkv is compiled in a
+Rust build stage, and only the resulting environment is copied into the final image.
+It expects the images mounted at `/images` and an index directory at `/index`, and
+listens on `$PORT` (8080 by default).
