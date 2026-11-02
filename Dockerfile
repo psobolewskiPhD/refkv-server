@@ -1,10 +1,5 @@
-# refkv is installed from git and built from source, which needs a Rust toolchain and git:
-# build the environment in a stage of its own, and copy it into a slim image
-FROM rust:1.90-slim-trixie AS build
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Build the environment in a stage of its own, and copy it into a slim image without uv
+FROM debian:trixie-slim AS build
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /bin/uv
 
@@ -38,7 +33,9 @@ RUN python serve_refkv_minimal.py --help > /dev/null
 # Defaults; override any REFKV_SERVE_<OPTION> at deploy time
 ENV REFKV_SERVE_ROOT=/images \
     REFKV_SERVE_INDEX_DIR=/index \
+    REFKV_SERVE_MAX_OPEN=16 \
     REFKV_SERVE_MAX_READS=64 \
+    REFKV_SERVE_MAX_INDEXING=2 \
     REFKV_SERVE_STATUS=false
 RUN mkdir -p /images /index
 

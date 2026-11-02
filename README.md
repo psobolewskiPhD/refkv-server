@@ -20,12 +20,8 @@ and tested with use of Claude Opus 5.5.
 ## Running
 
 The script declares its own dependencies, so it runs with
-[uv](https://docs.astral.sh/uv/). refkv's zarrify API is not yet released on PyPI,
-so the script pins refkv to a git commit, which uv builds from source on the first
-run. This needs `git`, and uses the [Rust toolchain](https://rustup.rs/) (1.85 or
-newer) on `PATH`; without one, refkv's build backend (maturin) downloads one for the
-build. Homebrew's `rustup` is keg-only: put `$(brew --prefix rustup)/bin` on `PATH`
-to use it.
+[uv](https://docs.astral.sh/uv/), which installs the versions locked in
+`serve_refkv_minimal.py.lock` (refkv 0.2.0, from its prebuilt wheels).
 
 ```sh
 uv run serve_refkv_minimal.py /path/to/images -i /path/to/index-cache
@@ -67,6 +63,7 @@ the server stops.
 | `--host` | 0.0.0.0 | Address to listen on |
 | `-n`, `--max-open` | 32 | Images kept open at once; least recently used are closed first |
 | `--max-reads` | 32 | Requests read from storage at once, across all images |
+| `--max-indexing` | 4 | Images indexed at once; on local storage, about the number of CPUs |
 | `--status/--no-status` | `--status` | Serve `/_status` |
 
 Each option can also be set with an environment variable named `REFKV_SERVE_<OPTION>`,
@@ -75,7 +72,8 @@ precedence.
 
 ## Docker
 
-The `Dockerfile` builds an image for Google Cloud Run. refkv is compiled in a
-Rust build stage, and only the resulting environment is copied into the final image.
+The `Dockerfile` builds an image for Google Cloud Run. The locked environment is
+installed with uv in a build stage, and only the environment is copied into the final
+image.
 It expects the images mounted at `/images` and an index directory at `/index`, and
 listens on `$PORT` (8080 by default).
