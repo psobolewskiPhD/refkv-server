@@ -3,8 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "click",
-#   # refkv's zarrify API, unreleased: built from git, with Rust (see the README)
-#   "refkv[zarr] @ git+https://github.com/d-v-b/refkv@6096eb667c76f485f8a16c6e22a68313f2e4adba#subdirectory=python",
+#   "refkv[zarr]>=0.2.0,<0.3",
 #   "zarr-http-server",
 # ]
 # ///
@@ -47,7 +46,9 @@ Storage: the image files are read through the filesystem, so the directory can b
 mount of network storage, such as NFS or a bucket mounted read-only with gcsfuse.
 --max-reads is how many requests are read from storage at once, across all images;
 on network storage, where each read waits on the network, raise it until throughput
-stops improving.
+stops improving. --max-indexing is how many images are indexed at once; indexing is
+CPU work on local storage, and each image being indexed holds its index in memory until
+it is saved.
 
 Everything refkv writes is served, including `refkv_source`, the file's original
 metadata (much as bioformats2raw keeps it in OME/METADATA.ome.xml). Keep the
@@ -67,7 +68,7 @@ from typing import NamedTuple
 
 import click
 import refkv.zarr
-from refkv.zarrify import Rejected, zarrify
+from refkv.zarrify import Rejected, zarrify_async
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -93,12 +94,15 @@ class ImageRouter:
     """ASGI app that sends each request for /<image file>/<key> to that image's Zarr store app,
     opening (and if needed indexing) the file on its first request."""
 
-    def __init__(self, root: pathlib.Path, index_dir: pathlib.Path, max_open: int, max_reads: int):
+    def __init__(self, root: pathlib.Path, index_dir: pathlib.Path, max_open: int, max_reads: int,
+                 max_indexing: int):
         self.root = root.resolve()
         self.index_dir = index_dir.resolve()
         self.max_open = max_open
         self.max_reads = max_reads
+        self.max_indexing = max_indexing
         self._reads = asyncio.Semaphore(max_reads)  # requests reading from storage, all images
+        self._indexing = asyncio.Semaphore(max_indexing)  # images being indexed
         self.open_images: OrderedDict[str, Starlette] = OrderedDict()  # least -> most recently used
         self._opening: dict[str, asyncio.Task] = {}  # images being opened, shared by their requests
 
@@ -134,28 +138,31 @@ class ImageRouter:
                 return None
         return None
 
-    def load_index(self, image: str) -> refkv.zarr.ZarrStore:
+    @staticmethod
+    def save_index(store: refkv.ReferenceStore, vzip: pathlib.Path) -> None:
+        """Write the index as a vzip archive at vzip. Blocking."""
+        vzip.parent.mkdir(parents=True, exist_ok=True)
+        partial = vzip.with_name(vzip.name + ".partial")
+        store.save(str(partial))
+        partial.replace(vzip)  # so a reader never sees a half-written index
+
+    async def load_index(self, image: str) -> refkv.zarr.ZarrStore:
         """The image file's refkv index as a read-only Zarr store: from the index directory
         if it is there, else built now and saved there. The image files are assumed never
         to change, so a saved index is not checked against its file.
         Raises refkv's Rejected for a file refkv can't read."""
-        path = (self.root / image).resolve()
         vzip = self.index_dir / f"{image}{INDEX_SUFFIX}"
-        if not vzip.is_file():
-            log.info("indexing %s -> %s", path, vzip)
-            vzip.parent.mkdir(parents=True, exist_ok=True)
-            partial = vzip.with_name(vzip.name + ".partial")
-            zarrify(str(path)).save(str(partial))
-            partial.replace(vzip)  # so a reader never sees a half-written index
+        if not await asyncio.to_thread(vzip.is_file):
+            # reads run on a refkv thread pool (one per index)
+            # other steps (opening the file, building and saving the
+            # index) take read threads
+            async with self._indexing:
+                path = await asyncio.to_thread((self.root / image).resolve)
+                log.info("indexing %s -> %s", path, vzip)
+                store = await zarrify_async(str(path))
+                await asyncio.to_thread(self.save_index, store, vzip)
         # no per-image cap on reads in flight: the router caps them across all images
-        return refkv.zarr.open(str(vzip), max_concurrency=None)
-
-    def make_image_app(self, image: str) -> Starlette:
-        """The zarr-http-server app serving the image file's index. Blocking: indexing reads
-        the file and can take seconds."""
-        # store_app serves every key of the store as stored, without parsing the arrays,
-        # so any codec or chunk grid refkv writes is passed through to the client
-        return store_app(self.load_index(image))
+        return await asyncio.to_thread(refkv.zarr.open, str(vzip), max_concurrency=None)
 
     async def get_image_app(self, image: str) -> Starlette:
         """The image's app: the open one, or opened now. Concurrent requests for an image
@@ -169,11 +176,12 @@ class ImageRouter:
         return await asyncio.shield(self._opening[image])
 
     async def _open_image(self, image: str) -> Starlette:
-        """Make the image's app in a worker thread, then keep it open, evicting the least
-        recently used images beyond max_open. An evicted image has nothing to close: it is
-        dropped, and freed once requests still using it finish."""
+        """Make the image's app, then keep it open, evicting the least recently used images
+        beyond max_open. An evicted image has nothing to close: it is dropped, and freed
+        once requests still using it finish."""
         try:
-            app = await asyncio.to_thread(self.make_image_app, image)
+            # store_app serves every key of the store as stored, without parsing the arrays,
+            app = store_app(await self.load_index(image))
         finally:
             del self._opening[image]  # a failed open is tried again on the next request
         self.open_images[image] = app
@@ -205,14 +213,14 @@ class ImageRouter:
 
 
 def build_app(root: pathlib.Path, index_dir: pathlib.Path, max_open: int, max_reads: int = 32,
-              status: bool = True) -> Starlette:
+              max_indexing: int = 4, status: bool = True) -> Starlette:
     """The server's ASGI app: the image router, /_status, and CORS for browser clients.
 
     max_reads caps the requests reading from storage at once, across all images. refkv
     may read files in the event loop's default thread pool, so the pool is sized to match
     at startup. Startup runs only when this is the top-level app: an app that mounts this
     one must size its own loop's pool."""
-    router = ImageRouter(root, index_dir, max_open, max_reads)
+    router = ImageRouter(root, index_dir, max_open, max_reads, max_indexing)
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -225,6 +233,7 @@ def build_app(root: pathlib.Path, index_dir: pathlib.Path, max_open: int, max_re
                              "index_dir": str(router.index_dir),
                              "max_open": router.max_open,
                              "max_reads": router.max_reads,
+                             "max_indexing": router.max_indexing,
                              "open": list(router.open_images)})  # least -> most recently used
 
     routes = [Route("/{path:path}", router, methods=["GET", "HEAD"])]
@@ -250,9 +259,12 @@ def build_app(root: pathlib.Path, index_dir: pathlib.Path, max_open: int, max_re
 @click.option("--max-reads", default=32, type=click.IntRange(min=1), show_envvar=True,
               help="Requests read from storage at once, across all images. Raise it for "
                    "network storage such as NFS or gcsfuse.")
+@click.option("--max-indexing", default=4, type=click.IntRange(min=1), show_envvar=True,
+              help="Images indexed at once. Each takes CPU and holds its index in memory "
+                   "until it is saved; on local storage, about the number of CPUs.")
 @click.option("--status/--no-status", default=True, show_envvar=True,
               help="Serve /_status, which lists open images' file names.")
-def main(root, index_dir, port, host, max_open, max_reads, status):
+def main(root, index_dir, port, host, max_open, max_reads, max_indexing, status):
     """Serve the image files under ROOT (or $REFKV_SERVE_ROOT) as read-only Zarr v3
     stores, indexed by refkv, with chunks sent as stored in the files."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -261,7 +273,8 @@ def main(root, index_dir, port, host, max_open, max_reads, status):
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         with tempfile.TemporaryDirectory(prefix="refkv-index-") as tmp:
-            app = build_app(root, index_dir or pathlib.Path(tmp), max_open, max_reads, status)
+            app = build_app(root, index_dir or pathlib.Path(tmp), max_open, max_reads,
+                            max_indexing, status)
             serve(app, host=host, port=port)
     except KeyboardInterrupt:
         pass
